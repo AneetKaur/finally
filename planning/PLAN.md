@@ -12,7 +12,7 @@ This is the capstone project for an agentic AI coding course. It is built entire
 
 ### First Launch
 
-The user runs a single Docker command (or a provided start script). A browser opens to `http://localhost:8000`. No login, no signup. They immediately see:
+The user runs a single Docker command (or a provided start script). The app is reachable at `http://localhost:8000` — the container itself cannot open the host browser, so `docker run` simply prints the URL; the host-side start scripts (§11) are what optionally open the browser. No login, no signup. They immediately see:
 
 - A watchlist of 10 default tickers with live-updating prices in a grid
 - $10,000 in virtual cash
@@ -167,7 +167,7 @@ Both the simulator and the Massive client implement the same abstract interface.
 ### Shared Price Cache
 
 - A single background task (simulator or Massive poller) writes to an in-memory price cache
-- The cache holds the latest price, previous price, and timestamp for each ticker
+- The cache holds the latest price, previous price, and timestamp for each ticker, plus a per-ticker freshness `status` (`live` / `stale`). The simulator's prices are always `live`. On the Massive path, prices go `stale` when a ticker hasn't updated within an expected window (closed market, weekend, or a failed poll) — staleness is a property of the data, distinct from connectivity. The header's connection dot reflects SSE connectivity only (§10); per-ticker freshness is carried in the price payload so the frontend can dim a stale quote without implying the whole stream is down.
 - **Priced ticker set** — the source tracks `watchlist ∪ tickers-with-an-open-position`. The API layer keeps this in sync: watchlist add/remove calls `source.add_ticker`/`source.remove_ticker`, and a buy that opens a new position adds its ticker. A watchlisted ticker the user still holds stays priced even after it's removed from the watchlist, until the position is closed — this guarantees every position always has a live price for valuation and P&L.
 - SSE streams read from this cache and push updates to connected clients
 - This architecture supports future multi-user scenarios without changes to the data layer
@@ -178,7 +178,7 @@ Both the simulator and the Massive client implement the same abstract interface.
 - Long-lived SSE connection; client uses native `EventSource` API
 - The server pushes a ticker's update **only when its price actually changes** — the cache carries a version counter for change detection, so a slow source like Massive's 15s poll never emits redundant events
 - A periodic heartbeat (an SSE comment line, every few seconds) keeps the connection and the header's connection-status indicator alive during quiet periods
-- Each SSE event contains ticker, price, previous price, timestamp, and change direction
+- Each SSE event contains ticker, price, previous price, timestamp, change direction, and freshness `status` (§ Shared Price Cache)
 - Client handles reconnection automatically (EventSource has built-in retry)
 
 ---
@@ -196,6 +196,8 @@ The backend checks for the SQLite database on startup (or first request). If the
 ### Schema
 
 All tables include a `user_id` column defaulting to `"default"`. This is hardcoded for now (single-user) but enables future multi-user support without schema migration.
+
+Monetary and quantity columns use SQLite `REAL` (binary float). For this single-user demo that's a deliberate, accepted trade-off: rather than integer-cents/decimal storage, the application layer keeps the artifacts invisible by rounding on every write — cash to 2 decimals (cents) and share quantities to 4 decimals (§8). Comparisons that gate trades (e.g. "enough cash", "enough shares") use these rounded values, so accumulated float drift never blocks or mis-fills a valid trade.
 
 **users_profile** — User state (cash balance)
 - `id` TEXT PRIMARY KEY (default: `"default"`)
@@ -265,6 +267,8 @@ All tables include a `user_id` column defaulting to `"default"`. This is hardcod
 
 `quantity` may be fractional. Share quantities are stored to 4 decimal places and cash math is rounded to cents. A sell that brings a position to 0 deletes the position row (§7).
 
+**Trade atomicity & serialization.** A trade touches three tables (`users_profile` cash, `positions`, `trades`) and they must move together. Each trade executes inside a single SQLite transaction: validate against current cash/holdings, then write the cash update, the position upsert/delete, and the append to `trades` — commit all or nothing. Because manual trades, AI-triggered trades (§9), and the snapshot jobs (§7) all run in one process, writes are serialized per user with an `asyncio` lock so two trades can't read the same cash balance and both pass validation. A `portfolio_snapshot` reads cash + positions + cached prices as one consistent view (taken outside any in-flight trade), so `total_value` never captures a half-applied trade.
+
 ### Watchlist
 | Method | Path | Description |
 |--------|------|-------------|
@@ -278,6 +282,57 @@ Both endpoints keep the market source's ticker set in sync (§6). Removing a tic
 | Method | Path | Description |
 |--------|------|-------------|
 | POST | `/api/chat` | Send a message, receive complete JSON response (message + executed actions) |
+
+### Ticker Validation & Normalization
+
+One rule, applied at the API boundary and reused by every path that accepts a ticker (watchlist add, manual trade, AI trade, market source):
+
+- **Normalize**: trim and uppercase the input (`aapl` → `AAPL`).
+- **Validate**: 1–5 characters, `A–Z` plus `.` and `-` only (covers symbols like `BRK.B`). Reject anything else with a 422.
+- **Supported set**: a ticker the market source can't price (unknown symbol) is rejected with a clear error rather than silently added — this keeps the watchlist, positions, and price cache from ever holding an unpriceable symbol.
+- **Duplicates**: adding a ticker already on the watchlist is idempotent (200, no duplicate row — enforced by the `UNIQUE(user_id, ticker)` constraint), not an error.
+
+### Response & Error Shapes
+
+All endpoints return JSON. Validation/business errors use FastAPI's default error envelope `{"detail": "..."}` with the status codes below; success shapes are illustrated by example.
+
+`GET /api/portfolio`:
+```json
+{
+  "cash_balance": 8500.00,
+  "total_value": 10120.50,
+  "positions": [
+    {"ticker": "AAPL", "quantity": 10.0, "avg_cost": 190.00,
+     "current_price": 192.05, "market_value": 1920.50,
+     "unrealized_pnl": 20.50, "pnl_pct": 1.08, "price_status": "live"}
+  ]
+}
+```
+
+`POST /api/portfolio/trade` — request `{"ticker": "AAPL", "quantity": 10, "side": "buy"}`; success `200`:
+```json
+{
+  "trade": {"ticker": "AAPL", "side": "buy", "quantity": 10.0, "price": 192.05,
+            "executed_at": "2026-06-21T15:00:00Z"},
+  "cash_balance": 6580.00
+}
+```
+Errors: `422` invalid ticker/side/quantity (non-positive); `400` insufficient cash (buy) or insufficient shares (sell); `400` when no live price is available for the ticker.
+
+`POST /api/watchlist` — `{"ticker": "PYPL"}` → `200` with the added entry (or existing entry if already present); `422` invalid/unsupported ticker. `DELETE /api/watchlist/{ticker}` → `200` (`204`-style success body `{"removed": "PYPL"}`); removing a ticker not on the watchlist returns `404`.
+
+`POST /api/chat` — `{"message": "..."}` → `200`:
+```json
+{
+  "message": "Bought 10 AAPL at $192.05. Your tech weight is now 40%.",
+  "actions": {
+    "trades": [{"ticker": "AAPL", "side": "buy", "quantity": 10, "price": 192.05, "status": "executed"}],
+    "rejected_trades": [{"ticker": "TSLA", "side": "buy", "quantity": 100, "status": "rejected", "error": "insufficient cash"}],
+    "watchlist_changes": [{"ticker": "PYPL", "action": "add", "status": "applied"}]
+  }
+}
+```
+The `actions` object mirrors what is persisted to `chat_messages.actions` (§7) — executed trades, rejected trades with their validation error, and watchlist changes.
 
 ### System
 | Method | Path | Description |
@@ -333,6 +388,18 @@ Trades specified by the LLM execute automatically — no confirmation dialog. Th
 - It demonstrates agentic AI capabilities — the core theme of the course
 
 If a trade fails validation (e.g., insufficient cash), the error is included in the chat response so the LLM can inform the user, and the rejected trade is recorded in that message's `actions` JSON (§7) for debugging.
+
+### Auto-Execution Guardrails
+
+Auto-execution is convenient but unbounded model output is a risk even with fake money — a single prompt could liquidate the portfolio or fire dozens of trades. The backend enforces these limits on the actions array *before* executing any of them (they are backend rules, not just prompt instructions):
+
+- **Max 5 actions per response** (trades + watchlist changes combined). Extras are dropped and reported back as rejected so the LLM can explain.
+- **Per-trade notional cap**: a single AI trade may not exceed 50% of current total portfolio value. Larger trades are rejected with an explanatory error.
+- **Same validation as manual trades**: sufficient cash for buys, sufficient shares for sells. This already means **no short selling** (can't sell shares you don't own) and **no margin/leverage** (can't buy beyond cash).
+- **Ticker normalization & validation** per §8 applies to every AI-specified ticker.
+- **Explicit-intent only**: the system prompt instructs the model to execute trades only when the user clearly asks for or agrees to a portfolio change — analysis and suggestions alone must not trigger trades.
+
+Every rejected or dropped action is surfaced in the chat `message` and recorded in `actions` (§7).
 
 ### System Prompt Guidance
 
@@ -397,6 +464,14 @@ Stage 2: Python 3.12 slim
 ```
 
 FastAPI serves the static frontend files and all API routes on port 8000.
+
+### Routing Precedence
+
+A single app serves both the API and the static export, so route order is explicit:
+
+1. `/api/*` and `/api/stream/*` are matched first. An unknown path under `/api/` returns a JSON `404` (`{"detail": "Not Found"}`) — it never falls through to HTML.
+2. Static assets from the export (`/_next/*`, `*.js`, `*.css`, images) are served directly, with long-lived cache headers on hashed asset filenames.
+3. Any other path (including deep links and post-refresh SPA routes) returns `index.html`, letting the client router take over. Because this is a static export it's effectively a single page, but the catch-all keeps a hard refresh on any URL from 404-ing.
 
 ### Docker Volume
 
@@ -507,3 +582,39 @@ _Added 2026-06-20 during a documentation review. The market data subsystem (§6)
   → **Resolved:** startup snapshot added to §7 (portfolio_snapshots).
 - **Defer the Massive path in docs, not code.** The Massive client is already built and tested, so no code change is needed — but for the remaining work, all new features (charts, portfolio, chat) should be developed and demoed against the simulator only. Treat Massive as a tested-but-secondary path so it doesn't add surface area to every new feature's testing.
   → **Resolved:** noted in §12 (E2E Tests, Environment).
+
+---
+
+## 14. Document Review — Contract Precision
+
+_Added 2026-06-21 during a second documentation review. §13's open questions were already folded into the body; this pass focused on contract precision (schemas, validation, atomicity, and the LLM action policy) for the parts still to be developed. All findings below have been folded into the body sections they cite._
+
+### High
+
+1. **LLM trade execution needs guardrails beyond "same validation as manual trades."** Auto-execution with no per-turn limits could let one prompt liquidate the portfolio or fire many trades. Define max actions per response, a per-trade notional cap, no short/no margin, ticker normalization, and execute-on-explicit-intent-only.
+   → **Resolved:** new "Auto-Execution Guardrails" subsection in §9 (max 5 actions/response, 50%-of-portfolio notional cap, no short/margin via existing validation, §8 ticker rules, explicit-intent only).
+
+2. **Concurrent trade and snapshot writes are underspecified for SQLite.** Manual trades, AI trades, startup/30s snapshots, and price reads all run in one process. State that a trade is atomic in one transaction, writes are serialized per user, and snapshots read a consistent view.
+   → **Resolved:** "Trade atomicity & serialization" note in §8 (single transaction across the three tables, per-user `asyncio` lock, consistent snapshot read).
+
+### Medium
+
+3. **API response schemas and error shapes are not defined.** Add JSON examples and error codes for portfolio, trade, watchlist, and chat — including validation errors, rejected AI trades, duplicate watchlist, and unavailable-price states.
+   → **Resolved:** "Response & Error Shapes" subsection in §8 with success examples and status codes per endpoint.
+
+4. **Static export plus FastAPI fallback behavior needs specifying.** Unknown non-API paths should return `index.html`; `/api/*` should return JSON errors; asset caching and refresh behavior should be explicit.
+   → **Resolved:** "Routing Precedence" subsection in §11.
+
+5. **Market session behavior is missing.** Real data has closed hours, stale prices, and API failures. Expose freshness/status metadata, since the connection dot reflects SSE connectivity, not price freshness.
+   → **Resolved:** per-ticker freshness `status` (`live`/`stale`) added to the price cache and SSE payload in §6; connection-dot-vs-freshness distinction stated.
+
+6. **Ticker validation and normalization should be centralized.** Define uppercase normalization, allowed characters, length, duplicate behavior, and unsupported-ticker behavior across all paths.
+   → **Resolved:** "Ticker Validation & Normalization" subsection in §8, reused by watchlist, manual trades, AI trades, and the market source.
+
+### Low
+
+7. **"Browser opens" on first launch isn't aligned with Docker.** A container can't open the host browser. Clarify that `docker run` prints the URL while host-side scripts may open the browser.
+   → **Resolved:** §2 (First Launch) reworded; §11 start scripts already note optional browser open.
+
+8. **Monetary precision should account for `REAL` floating point.** Either accept small float artifacts for this demo or use integer cents/decimal handling.
+   → **Resolved:** §7 schema note — `REAL` accepted as a deliberate demo trade-off, with cents/4-decimal rounding on every write so drift never gates a trade.

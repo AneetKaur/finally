@@ -1,0 +1,18 @@
+{
+    "name" : "AneetKaurSachdeva-marketplace" ,
+    "owner" : 
+    {
+        "name": "AneetKaurSachdeva",
+        "email": "aneetsachdeva11@gmail.com"
+    },
+    "plugins": [
+        {
+            "name": "Independent-Reviewer",
+            "source": "./independent-reviewer/.claude-plugin/plugin.json",
+            "description": "A plugin that provides independent reviews and feedback on all changes since last commit",
+            "version": "1.0.0",
+            "author": 
+            {"name": "AneetKaurSachdeva"}
+        }
+    ]
+}
